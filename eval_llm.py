@@ -1,7 +1,10 @@
 import time
 import argparse
+import json
+import math
 import random
 import warnings
+from pathlib import Path
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
@@ -31,25 +34,107 @@ def init_model(args):
     return model.half().eval().to(args.device), tokenizer
 
 
+def iter_jsonl(files):
+    for file_path in files:
+        with file_path.open('r', encoding='utf-8') as file:
+            for line in file:
+                if line.strip():
+                    yield json.loads(line)
+
+
+def prepare_ppl_sample(sample, tokenizer, is_pretrain, max_length):
+    if is_pretrain:
+        tokens = tokenizer(
+            str(sample['text']),
+            add_special_tokens=False,
+            max_length=max_length - 2,
+            truncation=True
+        ).input_ids
+        input_ids = [tokenizer.bos_token_id] + tokens + [tokenizer.eos_token_id]
+        labels = input_ids.copy()
+    else:
+        messages = []
+        tools = None
+        for message in sample['conversations']:
+            message = dict(message)
+            if message.get('role') == 'system' and message.get('tools'):
+                tools = json.loads(message['tools']) if isinstance(message['tools'], str) else message['tools']
+            if message.get('tool_calls') and isinstance(message['tool_calls'], str):
+                message['tool_calls'] = json.loads(message['tool_calls'])
+            messages.append(message)
+
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            tools=tools
+        )
+        input_ids = tokenizer(prompt).input_ids[:max_length]
+        labels = [-100] * len(input_ids)
+        assistant_bos = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
+        assistant_eos = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
+        index = 0
+        while index < len(input_ids):
+            if input_ids[index:index + len(assistant_bos)] != assistant_bos:
+                index += 1
+                continue
+            start = index + len(assistant_bos)
+            end = start
+            while end < len(input_ids) and input_ids[end:end + len(assistant_eos)] != assistant_eos:
+                end += 1
+            for label_index in range(start, min(end + len(assistant_eos), len(input_ids))):
+                labels[label_index] = input_ids[label_index]
+            index = end + len(assistant_eos)
+
+    return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+
+
 @torch.inference_mode()
-def calculate_perplexity(model, tokenizer, text, device):
-    max_length = getattr(model.config, 'max_position_embeddings', None)
-    tokenizer_kwargs = {
-        'return_tensors': 'pt',
-        'truncation': max_length is not None
-    }
-    if max_length is not None:
-        tokenizer_kwargs['max_length'] = max_length
+def calculate_dataset_perplexity(model, tokenizer, args):
+    if args.ppl_samples < 1:
+        raise ValueError('--ppl_samples must be at least 1.')
+    if args.ppl_max_length < 0:
+        raise ValueError('--ppl_max_length cannot be negative.')
 
-    inputs = tokenizer(text, **tokenizer_kwargs).to(device)
-    token_count = int(inputs['attention_mask'].sum().item())
-    if token_count < 2:
-        raise ValueError('PPL calculation requires at least 2 tokens.')
+    is_pretrain = 'pretrain' in args.weight
+    pattern = 'pretrain_*.jsonl' if is_pretrain else 'sft_*.jsonl'
+    dataset_files = sorted(Path(args.dataset_dir).glob(pattern))
+    if not dataset_files:
+        raise FileNotFoundError(f'No dataset files found: {Path(args.dataset_dir) / pattern}')
 
-    labels = inputs['input_ids'].clone()
-    labels[inputs['attention_mask'] == 0] = -100
-    loss = model(**inputs, labels=labels).loss.float()
-    return torch.exp(loss).item(), loss.item(), token_count
+    max_length = args.ppl_max_length or (340 if is_pretrain else 768)
+    model_max_length = getattr(model.config, 'max_position_embeddings', None) or max_length
+    max_length = min(max_length, model_max_length)
+    if max_length < 2:
+        raise ValueError('PPL maximum length must be at least 2.')
+    total_nll = 0.0
+    total_tokens = 0
+    sample_count = 0
+
+    for sample in iter_jsonl(dataset_files):
+        input_ids, labels = prepare_ppl_sample(sample, tokenizer, is_pretrain, max_length)
+        target_tokens = int((labels[1:] != -100).sum().item())
+        if target_tokens == 0:
+            continue
+
+        input_ids = input_ids.unsqueeze(0).to(args.device)
+        labels = labels.unsqueeze(0).to(args.device)
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            labels=labels
+        )
+        total_nll += outputs.loss.float().item() * target_tokens
+        total_tokens += target_tokens
+        sample_count += 1
+        if sample_count >= args.ppl_samples:
+            break
+
+    if sample_count == 0:
+        raise ValueError('No valid samples with target tokens were found.')
+
+    mean_loss = total_nll / total_tokens
+    return math.exp(mean_loss), mean_loss, total_tokens, sample_count, dataset_files
 
 
 def main():
@@ -68,7 +153,10 @@ def main():
     parser.add_argument('--open_thinking', default=0, type=int, help="是否开启自适应思考（0=否，1=是）")
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
-    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
+    parser.add_argument('--dataset_dir', default='dataset', type=str, help="PPL评测数据目录")
+    parser.add_argument('--ppl_samples', default=20, type=int, help="PPL快速评测使用的样本数")
+    parser.add_argument('--ppl_max_length', default=0, type=int, help="PPL单样本最大长度（0=按训练配置自动选择）")
+    parser.add_argument('--device', default='cpu' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     args = parser.parse_args()
     
     prompts = [
@@ -86,12 +174,10 @@ def main():
     model, tokenizer = init_model(args)
     input_mode = int(input('[0] 自动测试\n[1] 手动输入\n[2] PPL计算\n'))
     if input_mode == 2:
-        for text in iter(lambda: input('📝: '), ''):
-            try:
-                ppl, loss, token_count = calculate_perplexity(model, tokenizer, text, args.device)
-                print(f'[PPL]: {ppl:.4f} | [Loss]: {loss:.4f} | [Tokens]: {token_count}\n')
-            except ValueError as error:
-                print(f'[Error]: {error}\n')
+        ppl, loss, token_count, sample_count, dataset_files = calculate_dataset_perplexity(model, tokenizer, args)
+        print(f'[Dataset]: {", ".join(str(path) for path in dataset_files)}')
+        print(f'[Samples]: {sample_count} | [Tokens]: {token_count}')
+        print(f'[PPL]: {ppl:.4f} | [Loss]: {loss:.4f}\n')
         return
 
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
