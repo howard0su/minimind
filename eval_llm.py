@@ -9,6 +9,7 @@ from model.model_lora import *
 from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
 
+
 def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
     if 'model' in args.load_from:
@@ -28,6 +29,28 @@ def init_model(args):
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     get_model_params(model, model.config)
     return model.half().eval().to(args.device), tokenizer
+
+
+@torch.inference_mode()
+def calculate_perplexity(model, tokenizer, text, device):
+    max_length = getattr(model.config, 'max_position_embeddings', None)
+    tokenizer_kwargs = {
+        'return_tensors': 'pt',
+        'truncation': max_length is not None
+    }
+    if max_length is not None:
+        tokenizer_kwargs['max_length'] = max_length
+
+    inputs = tokenizer(text, **tokenizer_kwargs).to(device)
+    token_count = int(inputs['attention_mask'].sum().item())
+    if token_count < 2:
+        raise ValueError('PPL calculation requires at least 2 tokens.')
+
+    labels = inputs['input_ids'].clone()
+    labels[inputs['attention_mask'] == 0] = -100
+    loss = model(**inputs, labels=labels).loss.float()
+    return torch.exp(loss).item(), loss.item(), token_count
+
 
 def main():
     parser = argparse.ArgumentParser(description="MiniMind模型推理与对话")
@@ -61,7 +84,16 @@ def main():
     
     conversation = []
     model, tokenizer = init_model(args)
-    input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
+    input_mode = int(input('[0] 自动测试\n[1] 手动输入\n[2] PPL计算\n'))
+    if input_mode == 2:
+        for text in iter(lambda: input('📝: '), ''):
+            try:
+                ppl, loss, token_count = calculate_perplexity(model, tokenizer, text, args.device)
+                print(f'[PPL]: {ppl:.4f} | [Loss]: {loss:.4f} | [Tokens]: {token_count}\n')
+            except ValueError as error:
+                print(f'[Error]: {error}\n')
+        return
+
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     
     prompt_iter = prompts if input_mode == 0 else iter(lambda: input('💬: '), '')
