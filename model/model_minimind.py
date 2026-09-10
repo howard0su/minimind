@@ -100,6 +100,7 @@ class Attention(nn.Module):
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size, config.num_attention_heads, bias=False)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -129,7 +130,9 @@ class Attention(nn.Module):
             if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
             if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
-        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = output.transpose(1, 2)
+        output = output * torch.sigmoid(self.gate_proj(x)).unsqueeze(-1)
+        output = output.reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
